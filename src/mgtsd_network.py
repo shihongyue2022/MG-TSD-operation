@@ -44,7 +44,7 @@ class mgtsdTrainingNetwork(nn.Module):
     ) -> None:
         super().__init__(**kwargs)
         self.target_dim = target_dim
-        self.target_dim_2 = 2*target_dim
+        self.target_dim_2 = 2 * target_dim
         self.prediction_length = prediction_length
         self.context_length = context_length
         self.history_length = history_length
@@ -53,22 +53,26 @@ class mgtsdTrainingNetwork(nn.Module):
         self.weights = weights
         self.share_ratio_list = share_ratio_list
         self.num_gran = num_gran
-        self.split_size = [self.target_dim]*self.num_gran
+        self.split_size = [self.target_dim] * self.num_gran
 
-        assert len(set(lags_seq)) == len(
-            lags_seq), "no duplicated lags allowed!"
+        assert len(set(lags_seq)) == len(lags_seq), "no duplicated lags allowed!"
         lags_seq.sort()
         self.lags_seq = lags_seq
 
         self.cell_type = cell_type
         rnn_cls = {"LSTM": nn.LSTM, "GRU": nn.GRU}[cell_type]  # rnn class
-        self.rnn = nn.ModuleList([rnn_cls(
-            input_size=input_size,
-            hidden_size=num_cells,
-            num_layers=num_layers,
-            dropout=dropout_rate,
-            batch_first=True,
-        ) for _ in range(self.num_gran)])  # shape: (batch_size, seq_len, num_cells)
+        self.rnn = nn.ModuleList(
+            [
+                rnn_cls(
+                    input_size=input_size,
+                    hidden_size=num_cells,
+                    num_layers=num_layers,
+                    dropout=dropout_rate,
+                    batch_first=True,
+                )
+                for _ in range(self.num_gran)
+            ]
+        )  # shape: (batch_size, seq_len, num_cells)
 
         self.denoise_fn = EpsilonTheta(
             target_dim=target_dim,
@@ -93,12 +97,9 @@ class mgtsdTrainingNetwork(nn.Module):
             self.diffusion, input_size=target_dim, cond_size=conditioning_length
         )  # distribution output
 
-        self.proj_dist_args = self.distr_output.get_args_proj(
-            num_cells)  # projection distribution arguments
+        self.proj_dist_args = self.distr_output.get_args_proj(num_cells)  # projection distribution arguments
         self.embed_dim = 1
-        self.embed = nn.Embedding(
-            num_embeddings=self.target_dim, embedding_dim=self.embed_dim
-        )
+        self.embed = nn.Embedding(num_embeddings=self.target_dim, embedding_dim=self.embed_dim)
 
         if self.scaling:
             self.scaler = MeanScaler(keepdim=True)
@@ -148,8 +149,7 @@ class mgtsdTrainingNetwork(nn.Module):
             begin_index = -lag_index - subsequences_length
             end_index = -lag_index if lag_index > 0 else None
             # shape: (batch_size, 1, sub_seq_len, C)
-            lagged_values.append(
-                sequence[:, begin_index:end_index, ...].unsqueeze(1))
+            lagged_values.append(sequence[:, begin_index:end_index, ...].unsqueeze(1))
         # shape: (batch_size, sub_seq_len, C, I) I = len(indices)=3
         return torch.cat(lagged_values, dim=1).permute(0, 2, 3, 1)
 
@@ -185,9 +185,7 @@ class mgtsdTrainingNetwork(nn.Module):
         # (batch_size, sub_seq_len, target_dim, num_lags)
         lags_scaled = lags / scale.unsqueeze(-1)
 
-        input_lags = lags_scaled.reshape(
-            (-1, unroll_length, len(self.lags_seq) * self.target_dim)
-        )
+        input_lags = lags_scaled.reshape((-1, unroll_length, len(self.lags_seq) * self.target_dim))
 
         # (batch_size, target_dim, embed_dim)
         index_embeddings = self.embed(target_dimension_indicator)
@@ -200,8 +198,7 @@ class mgtsdTrainingNetwork(nn.Module):
         )
 
         # (batch_size, sub_seq_len, input_dim)
-        inputs = torch.cat(
-            (input_lags, repeated_index_embeddings, time_feat), dim=-1)
+        inputs = torch.cat((input_lags, repeated_index_embeddings, time_feat), dim=-1)
 
         # unroll encoder
         rnn = self.rnn[gran_index]
@@ -230,57 +227,17 @@ class mgtsdTrainingNetwork(nn.Module):
         past_target_cdf and a vector of static features that was constructed
         and fed as input to the encoder. All tensor arguments should have NTC
         layout.
-
-        Parameters
-        ----------
-        past_time_feat
-            Past time features (batch_size, history_length, num_features)
-        past_target_cdf
-            Past marginal CDF transformed target values (batch_size,
-            history_length, target_dim)
-        past_observed_values
-            Indicator whether or not the values were observed (batch_size,
-            history_length, target_dim)
-        past_is_pad
-            Indicator whether the past target values have been padded
-            (batch_size, history_length)
-        future_time_feat
-            Future time features (batch_size, prediction_length, num_features)
-        future_target_cdf
-            Future marginal CDF transformed target values (batch_size,
-            prediction_length, target_dim)
-        target_dimension_indicator
-            Dimensionality of the time series (batch_size, target_dim)
-
-        Returns
-        -------
-        outputs
-            RNN outputs (batch_size, seq_len, num_cells)
-        states
-            RNN states. Nested list with (batch_size, num_cells) tensors with
-        dimensions target_dim x num_layers x (batch_size, num_cells)
-        scale
-            Mean scales for the time series (batch_size, 1, target_dim)
-        lags_scaled
-            Scaled lags(batch_size, sub_seq_len, target_dim, num_lags)
-        inputs
-            inputs to the RNN
-
         """
-
-        past_observed_values = torch.min(
-            past_observed_values, 1 - past_is_pad.unsqueeze(-1)
-        )
+        past_observed_values = torch.min(past_observed_values, 1 - past_is_pad.unsqueeze(-1))
 
         if future_time_feat is None or future_target_cdf is None:
-            time_feat = past_time_feat[:, -self.context_length:, ...]
+            time_feat = past_time_feat[:, -self.context_length :, ...]
             sequence = past_target_cdf
             sequence_length = self.history_length
             subsequences_length = self.context_length
         else:
             time_feat = torch.cat(
-                (past_time_feat[:, -self.context_length:, ...],
-                 future_time_feat),
+                (past_time_feat[:, -self.context_length :, ...], future_time_feat),
                 dim=1,
             )
             sequence = torch.cat((past_target_cdf, future_target_cdf), dim=1)
@@ -290,23 +247,25 @@ class mgtsdTrainingNetwork(nn.Module):
         # change1: split the sequence into fine and coarse-graine dataset
         sequences = torch.split(sequence, self.split_size, dim=2)
         # (batch_size, sub_seq_len, target_dim, num_lags)
-        lags = [self.get_lagged_subsequences(
-            sequence=sequence,
-            sequence_length=sequence_length,
-            indices=self.lags_seq,
-            subsequences_length=subsequences_length,
-        ) for sequence in sequences]
+        lags = [
+            self.get_lagged_subsequences(
+                sequence=sequence,
+                sequence_length=sequence_length,
+                indices=self.lags_seq,
+                subsequences_length=subsequences_length,
+            )
+            for sequence in sequences
+        ]
 
         # scale is computed on the context length last units of the past target
         # scale shape is (batch_size, 1, target_dim)
         _, scale = self.scaler(
-            past_target_cdf[:, -self.context_length:, ...],
-            past_observed_values[:, -self.context_length:, ...],
+            past_target_cdf[:, -self.context_length :, ...],
+            past_observed_values[:, -self.context_length :, ...],
         )
 
         scales = torch.split(scale, self.split_size, dim=2)
-        target_dimension_indicators = torch.split(
-            target_dimension_indicator, self.split_size, dim=1)
+        target_dimension_indicators = torch.split(target_dimension_indicator, self.split_size, dim=1)
         outputs = []
         states = []
         lags_scaled = []
@@ -332,20 +291,6 @@ class mgtsdTrainingNetwork(nn.Module):
     def distr_args(self, rnn_outputs: torch.Tensor):
         """
         Returns the distribution of DeepVAR with respect to the RNN outputs.
-
-        Parameters
-        ----------
-        rnn_outputs
-            Outputs of the unrolled RNN (batch_size, seq_len, num_cells)
-        scale
-            Mean scale for each time series (batch_size, 1, target_dim)
-
-        Returns
-        -------
-        distr
-            Distribution instance
-        distr_args
-            Distribution arguments
         """
         (distr_args,) = self.proj_dist_args(rnn_outputs)
         return distr_args
@@ -364,44 +309,7 @@ class mgtsdTrainingNetwork(nn.Module):
         """
         Computes the loss for training DeepVAR, all inputs tensors representing
         time series have NTC layout.
-
-        Parameters
-        ----------
-        target_dimension_indicator
-            Indices of the target dimension (batch_size, target_dim)
-        past_time_feat
-            Dynamic features of past time series (batch_size, history_length,
-            num_features)
-        past_target_cdf
-            Past marginal CDF transformed target values (batch_size,
-            history_length, target_dim)
-        past_observed_values
-            Indicator whether or not the values were observed (batch_size,
-            history_length, target_dim)
-        past_is_pad
-            Indicator whether the past target values have been padded
-            (batch_size, history_length)
-        future_time_feat
-            Future time features (batch_size, prediction_length, num_features)
-        future_target_cdf
-            Future marginal CDF transformed target values (batch_size,
-            prediction_length, target_dim)
-        future_observed_values
-            Indicator whether or not the future values were observed
-            (batch_size, prediction_length, target_dim)
-
-        Returns
-        -------
-        distr
-            Loss with shape (batch_size, 1)
-        likelihoods
-            Likelihoods for each time step
-            (batch_size, context + prediction_length, 1)
-        distr_args
-            Distribution arguments (context + prediction_length,
-            number_of_arguments)
         """
-
         seq_len = self.context_length + self.prediction_length
 
         # unroll the decoder in "training mode", i.e. by providing future data
@@ -418,36 +326,35 @@ class mgtsdTrainingNetwork(nn.Module):
         # put together target sequence
         # (batch_size, seq_len, target_dim)
         target = torch.cat(
-            (past_target_cdf[:, -self.context_length:, ...],
-             future_target_cdf),
+            (past_target_cdf[:, -self.context_length :, ...], future_target_cdf),
             dim=1,
         )
-        target = target/scale
+        target = target / scale
         targets = torch.split(target, self.split_size, dim=2)
 
         # specifiy the beta variance for the coarse-grained dataset,
         # the scalars in the forward and backward(sampling)are different
 
         rnn_outputs_2 = rnn_outputs  # outputs from multiple rnns
-        distr_args = [self.distr_args(rnn_output)
-                      for rnn_output in rnn_outputs_2]
+        distr_args = [self.distr_args(rnn_output) for rnn_output in rnn_outputs_2]
 
         likelihoods = []
         for ratio_index, share_ratio in enumerate(self.share_ratio_list):
-            cur_likelihood = self.diffusion.log_prob(targets[ratio_index], distr_args[ratio_index],
-                                                     share_ratio=share_ratio).unsqueeze(-1)
+            cur_likelihood = self.diffusion.log_prob(
+                targets[ratio_index],
+                distr_args[ratio_index],
+                share_ratio=share_ratio,
+            ).unsqueeze(-1)
             likelihoods.append(cur_likelihood)
 
         if self.scaling:
             self.diffusion.scale = scale
 
-        past_observed_values = torch.min(
-            past_observed_values, 1 - past_is_pad.unsqueeze(-1)
-        )
+        past_observed_values = torch.min(past_observed_values, 1 - past_is_pad.unsqueeze(-1))
 
         observed_values = torch.cat(
             (
-                past_observed_values[:, -self.context_length:, ...],
+                past_observed_values[:, -self.context_length :, ...],
                 future_observed_values,
             ),
             dim=1,
@@ -457,11 +364,9 @@ class mgtsdTrainingNetwork(nn.Module):
         # in the target dimensions (batch_size, subseq_length, 1)
         loss_weights, _ = observed_values.min(dim=-1, keepdim=True)
 
-        loss = [weighted_average(
-            likelihood, weights=loss_weights, dim=1).mean() for likelihood in likelihoods]
+        loss = [weighted_average(likelihood, weights=loss_weights, dim=1).mean() for likelihood in likelihoods]
 
-        loss = sum(loss_item * weight_item for loss_item,
-                   weight_item in zip(loss, self.weights))
+        loss = sum(loss_item * weight_item for loss_item, weight_item in zip(loss, self.weights))
         return (loss, likelihoods, distr_args)
 
 
@@ -489,51 +394,46 @@ class mgtsdPredictionNetwork(mgtsdTrainingNetwork):
         """
         Computes sample paths by unrolling the RNN starting with a initial
         input and state.
-
-        Parameters
-        ----------
-        past_target_cdf
-            Past marginal CDF transformed target values (batch_size,
-            history_length, target_dim)
-        target_dimension_indicator
-            Indices of the target dimension (batch_size, target_dim)
-        time_feat
-            Dynamic features of future time series (batch_size, history_length,
-            num_features)
-        scale
-            Mean scale for each time series (batch_size, 1, target_dim)
-        begin_states
-            List of initial states for the RNN layers (batch_size, num_cells)
-        Returns
-        --------
-        sample_paths : Tensor
-            A tensor containing sampled paths. Shape: (1, num_sample_paths,
-            prediction_length, target_dim).
         """
 
-        def repeat(tensor, dim=0):
-            return tensor.repeat_interleave(repeats=self.num_parallel_samples, dim=dim)
+        # --- SAFE repeat: 支持 Tensor / list / tuple（LSTM 状态为 (h,c) 的 tuple）---
+        def repeat_any(obj, dim=0):
+            """
+            Repeat along given dim for:
+              - Tensor: use repeat_interleave
+              - list/tuple: recursively apply to each element, keep container type
+            """
+            if isinstance(obj, torch.Tensor):
+                return obj.repeat_interleave(repeats=self.num_parallel_samples, dim=dim)
+            elif isinstance(obj, list):
+                return [repeat_any(x, dim=dim) for x in obj]
+            elif isinstance(obj, tuple):
+                return tuple(repeat_any(x, dim=dim) for x in obj)
+            else:
+                # unexpected type; return as-is
+                return obj
 
         # blows-up the dimension of each tensor to
         # batch_size * self.num_sample_paths for increasing parallelism
-        past_target_cdf_list = torch.split(
-            past_target_cdf, self.split_size, dim=2)
-        repeated_past_target_cdf_list = [
-            repeat(past_target_cdf) for past_target_cdf in past_target_cdf_list]
+        past_target_cdf_list = torch.split(past_target_cdf, self.split_size, dim=2)
+        repeated_past_target_cdf_list = [repeat_any(x) for x in past_target_cdf_list]
 
-        repeated_time_feat = repeat(time_feat)
+        repeated_time_feat = repeat_any(time_feat)
         scales_list = torch.split(scale, self.split_size, dim=2)
-        repeated_scales_list = []
-        repeated_scales_list = [repeat(scale) for scale in scales_list]
+        repeated_scales_list = [repeat_any(s) for s in scales_list]
 
-        repeated_target_dimension_indicator = repeat(
-            target_dimension_indicator[:, :self.target_dim])
+        repeated_target_dimension_indicator = repeat_any(target_dimension_indicator[:, : self.target_dim])
 
+        # begin_states:
+        #  - GRU: Tensor (num_layers, B, hidden)
+        #  - LSTM: Tuple(h, c) where each is Tensor (num_layers, B, hidden)
         if self.cell_type == "LSTM":
-            repeated_states_list = [repeat(s, dim=1) for s in begin_states]
+            # begin_states is list[ (h,c), (h,c), ... ] per granularity
+            repeated_states_list = [repeat_any(s, dim=1) for s in begin_states]
         else:
-            repeated_states_list = [
-                repeat(begin_state, dim=1) for begin_state in begin_states]
+            # begin_states is list[ state, state, ... ], each Tensor
+            repeated_states_list = [repeat_any(s, dim=1) for s in begin_states]
+
         # for each future time-units we draw new samples for this time-unit
         # and update the state
         future_samples_list = [[] for _ in range(self.num_gran)]
@@ -551,26 +451,28 @@ class mgtsdPredictionNetwork(mgtsdTrainingNetwork):
                     lags=lags,
                     scale=repeated_scales_list[m],
                     gran_index=m,  # use rnn which corresponding gran
-                    time_feat=repeated_time_feat[:, k: k + 1, ...],
+                    time_feat=repeated_time_feat[:, k : k + 1, ...],
                     target_dimension_indicator=repeated_target_dimension_indicator,
                     unroll_length=1,
                 )
                 distr_args = self.distr_args(rnn_outputs)
-                new_samples = self.diffusion.sample(cond=distr_args,
-                                                    share_ratio=share_ratio)
+                new_samples = self.diffusion.sample(cond=distr_args, share_ratio=share_ratio)
 
                 new_samples *= repeated_scales_list[m]
 
                 future_samples_list[m].append(new_samples)
                 repeated_past_target_cdf_list[m] = torch.cat(
-                    (repeated_past_target_cdf_list[m], new_samples), dim=1)
+                    (repeated_past_target_cdf_list[m], new_samples), dim=1
+                )
 
         # (batch_size * num_samples, prediction_length, target_dim)
-        samples_list = [torch.cat(future_samples, dim=1)
-                        for future_samples in future_samples_list]
-        samples_reshape_list = [samples.reshape((-1, self.num_parallel_samples,
-                                                self.prediction_length, self.target_dim,
-                                                 )) for samples in samples_list]
+        samples_list = [torch.cat(future_samples, dim=1) for future_samples in future_samples_list]
+        samples_reshape_list = [
+            samples.reshape(
+                (-1, self.num_parallel_samples, self.prediction_length, self.target_dim),
+            )
+            for samples in samples_list
+        ]
 
         samples = torch.cat(samples_reshape_list, dim=3)
         return samples  # output multiple forecasts
@@ -587,38 +489,10 @@ class mgtsdPredictionNetwork(mgtsdTrainingNetwork):
         """
         Predicts samples given the trained DeepVAR model.
         All tensors should have NTC layout.
-        Parameters
-        ----------
-        target_dimension_indicator
-            Indices of the target dimension (batch_size, target_dim)
-        past_time_feat
-            Dynamic features of past time series (batch_size, history_length,
-            num_features)
-        past_target_cdf
-            Past marginal CDF transformed target values (batch_size,
-            history_length, target_dim)
-        past_observed_values
-            Indicator whether or not the values were observed (batch_size,
-            history_length, target_dim)
-        past_is_pad
-            Indicator whether the past target values have been padded
-            (batch_size, history_length)
-        future_time_feat
-            Future time features (batch_size, prediction_length, num_features)
-
-        Returns
-        -------
-        sample_paths : Tensor
-            A tensor containing sampled paths (1, num_sample_paths,
-            prediction_length, target_dim).
-
         """
-
         # mark padded data as unobserved
         # (batch_size, target_dim, seq_len)
-        past_observed_values = torch.min(
-            past_observed_values, 1 - past_is_pad.unsqueeze(-1)
-        )
+        past_observed_values = torch.min(past_observed_values, 1 - past_is_pad.unsqueeze(-1))
 
         # unroll the decoder in "prediction mode", i.e. with past data only
         _, begin_states, scale, _, _ = self.unroll_encoder(
