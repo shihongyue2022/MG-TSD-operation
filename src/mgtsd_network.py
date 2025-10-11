@@ -1,4 +1,4 @@
-from torch.nn.modules import loss
+# -*- coding: utf-8 -*-
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -6,7 +6,6 @@ import torch.nn as nn
 
 from gluonts.core.component import validated
 from utils import weighted_average, MeanScaler, NOPScaler
-# from module import GaussianDiffusion,DiffusionOutput
 from mgtsd_module import GaussianDiffusion, DiffusionOutput
 from epsilon_theta import EpsilonTheta
 
@@ -135,9 +134,6 @@ class mgtsdTrainingNetwork(nn.Module):
             containing lagged subsequences.
             Specifically, lagged[i, :, j, k] = sequence[i, -indices[k]-S+j, :].
         """
-        # we must have: history_length + begin_index >= 0
-        # that is: history_length - lag_index - sequence_length >= 0
-        # hence the following assert
         assert max(indices) + subsequences_length <= sequence_length, (
             f"lags cannot go further than history length, found lag "
             f"{max(indices)} while history length is only {sequence_length}"
@@ -169,19 +165,8 @@ class mgtsdTrainingNetwork(nn.Module):
         torch.Tensor,
     ]:
         """
-
-        Args:
-            lags (torch.Tensor): lagged sub-sequences
-            scale (torch.Tensor): 归一化
-            time_feat (torch.Tensor): _description_
-            target_dimension_indicator (torch.Tensor): _description_
-            unroll_length (int): _description_
-            begin_state (Optional[Union[List[torch.Tensor], torch.Tensor]], optional): _description_. Defaults to None.
-
-        Returns:
-            Tuple[ torch.Tensor, Union[List[torch.Tensor], torch.Tensor], torch.Tensor, torch.Tensor, ]: _description_
+        One-step (or multi-step) unroll for a given granularity.
         """
-
         # (batch_size, sub_seq_len, target_dim, num_lags)
         lags_scaled = lags / scale.unsqueeze(-1)
 
@@ -244,7 +229,7 @@ class mgtsdTrainingNetwork(nn.Module):
             sequence_length = self.history_length + self.prediction_length
             subsequences_length = self.context_length + self.prediction_length
 
-        # change1: split the sequence into fine and coarse-graine dataset
+        # split sequence into fine/coarse
         sequences = torch.split(sequence, self.split_size, dim=2)
         # (batch_size, sub_seq_len, target_dim, num_lags)
         lags = [
@@ -257,8 +242,7 @@ class mgtsdTrainingNetwork(nn.Module):
             for sequence in sequences
         ]
 
-        # scale is computed on the context length last units of the past target
-        # scale shape is (batch_size, 1, target_dim)
+        # scale on the last context_length
         _, scale = self.scaler(
             past_target_cdf[:, -self.context_length :, ...],
             past_observed_values[:, -self.context_length :, ...],
@@ -331,9 +315,6 @@ class mgtsdTrainingNetwork(nn.Module):
         )
         target = target / scale
         targets = torch.split(target, self.split_size, dim=2)
-
-        # specifiy the beta variance for the coarse-grained dataset,
-        # the scalars in the forward and backward(sampling)are different
 
         rnn_outputs_2 = rnn_outputs  # outputs from multiple rnns
         distr_args = [self.distr_args(rnn_output) for rnn_output in rnn_outputs_2]
@@ -413,29 +394,82 @@ class mgtsdPredictionNetwork(mgtsdTrainingNetwork):
                 # unexpected type; return as-is
                 return obj
 
-        # blows-up the dimension of each tensor to
-        # batch_size * self.num_sample_paths for increasing parallelism
+        # --- 兜底：保证 future_time_feat 在时间维上有 prediction_length，并且通道维>=1 ---
+        def ensure_future_time_feat(tf: torch.Tensor, pred_len: int) -> torch.Tensor:
+            if not isinstance(tf, torch.Tensor):
+                # 极端容错：直接创建占位特征
+                return torch.ones(
+                    past_target_cdf.size(0) * self.num_parallel_samples,
+                    pred_len,
+                    1,
+                    device=scales_list[0].device,
+                    dtype=scales_list[0].dtype,
+                )
+
+            B = past_target_cdf.size(0)
+            # 先把样本维重复
+            tf_rep = repeat_any(tf)  # (B*num_samples, L, F?) 或 (B*num_samples, 0, F?)
+            # 缺通道维时补 1
+            if tf_rep.dim() == 2:
+                tf_rep = tf_rep.unsqueeze(-1)
+
+            L = tf_rep.size(1) if tf_rep.dim() >= 3 else 0
+            F = tf_rep.size(-1) if tf_rep.dim() >= 3 else 0
+
+            # 通道数为 0 时补 1
+            if F == 0:
+                tf_rep = torch.ones(
+                    B * self.num_parallel_samples,
+                    L,
+                    1,
+                    device=tf_rep.device,
+                    dtype=tf_rep.dtype,
+                )
+
+            # 长度裁剪/填充到 pred_len
+            L = tf_rep.size(1)
+            if L == 0:
+                tf_rep = torch.ones(
+                    B * self.num_parallel_samples,
+                    pred_len,
+                    tf_rep.size(-1),
+                    device=tf_rep.device,
+                    dtype=tf_rep.dtype,
+                )
+            elif L < pred_len:
+                # 用最后一个步的特征做延长（或全 1）
+                last = tf_rep[:, -1:, :] if L > 0 else torch.ones(
+                    B * self.num_parallel_samples, 1, tf_rep.size(-1), device=tf_rep.device, dtype=tf_rep.dtype
+                )
+                pad = last.expand(-1, pred_len - L, -1)
+                tf_rep = torch.cat([tf_rep, pad], dim=1)
+            elif L > pred_len:
+                tf_rep = tf_rep[:, :pred_len, :]
+
+            return tf_rep
+
+        # --- 准备并重复输入 ---
         past_target_cdf_list = torch.split(past_target_cdf, self.split_size, dim=2)
         repeated_past_target_cdf_list = [repeat_any(x) for x in past_target_cdf_list]
 
-        repeated_time_feat = repeat_any(time_feat)
         scales_list = torch.split(scale, self.split_size, dim=2)
         repeated_scales_list = [repeat_any(s) for s in scales_list]
 
         repeated_target_dimension_indicator = repeat_any(target_dimension_indicator[:, : self.target_dim])
 
+        # 关键：保证 future_time_feat 合法
+        # 注意 ensure_future_time_feat 内部会做 repeat_any
+        repeated_time_feat = ensure_future_time_feat(time_feat, self.prediction_length)
+
         # begin_states:
         #  - GRU: Tensor (num_layers, B, hidden)
         #  - LSTM: Tuple(h, c) where each is Tensor (num_layers, B, hidden)
         if self.cell_type == "LSTM":
-            # begin_states is list[ (h,c), (h,c), ... ] per granularity
             repeated_states_list = [repeat_any(s, dim=1) for s in begin_states]
         else:
-            # begin_states is list[ state, state, ... ], each Tensor
             repeated_states_list = [repeat_any(s, dim=1) for s in begin_states]
 
-        # for each future time-units we draw new samples for this time-unit
-        # and update the state
+        # decode future
         future_samples_list = [[] for _ in range(self.num_gran)]
         for k in range(self.prediction_length):  # future samples from multi-gran
             for m in range(self.num_gran):
@@ -451,7 +485,7 @@ class mgtsdPredictionNetwork(mgtsdTrainingNetwork):
                     lags=lags,
                     scale=repeated_scales_list[m],
                     gran_index=m,  # use rnn which corresponding gran
-                    time_feat=repeated_time_feat[:, k : k + 1, ...],
+                    time_feat=repeated_time_feat[:, k : k + 1, :],
                     target_dimension_indicator=repeated_target_dimension_indicator,
                     unroll_length=1,
                 )
@@ -491,7 +525,6 @@ class mgtsdPredictionNetwork(mgtsdTrainingNetwork):
         All tensors should have NTC layout.
         """
         # mark padded data as unobserved
-        # (batch_size, target_dim, seq_len)
         past_observed_values = torch.min(past_observed_values, 1 - past_is_pad.unsqueeze(-1))
 
         # unroll the decoder in "prediction mode", i.e. with past data only

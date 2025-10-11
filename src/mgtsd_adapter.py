@@ -11,8 +11,12 @@ from typing import Any, Dict, Optional, Iterable, Tuple, List
 import numpy as np
 import torch
 import pandas as pd
+import warnings
 from gluonts.dataset.common import ListDataset
 from gluonts.exceptions import GluonTSDataError
+
+# 静默 pandas 关于 Timestamp.freq 的弃用告警
+warnings.filterwarnings("ignore", message=".*Timestamp.freq is deprecated.*")
 
 # ===================== GluonTS 时间相关补丁（稳健） =====================
 
@@ -50,13 +54,16 @@ try:
             return None
 
     def _norm_start_and_freq(start, fallback_freq: str = "B") -> Tuple[pd.Timestamp, str]:
+        """
+        统一把 start 归一为 Timestamp，并给出频率字符串。
+        注意：为避免 pandas 弃用告警，这里绝不访问 Timestamp.freq。
+        """
         if isinstance(start, pd.Period):
             freq_str = start.freqstr or fallback_freq
             return start.start_time, str(freq_str)
         if isinstance(start, pd.Timestamp):
-            fs = getattr(start, "freq", None)
-            freq_str = _rule_code(fs) or fallback_freq
-            return start, str(freq_str)
+            # 不读取 start.freq（已弃用），直接用 fallback
+            return start, str(fallback_freq)
         try:
             p = pd.Period(str(start), freq=fallback_freq)
             return p.start_time, fallback_freq
