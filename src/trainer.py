@@ -19,7 +19,7 @@ class Trainer:
     @validated()
     def __init__(
         self,
-        epochs: int = 50,
+        epochs: int = 10,
         batch_size: int = 32,
         num_batches_per_epoch: int = 50,
         learning_rate: float = 1e-3,

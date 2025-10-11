@@ -63,7 +63,13 @@ def _patch_split_shift_timestamp(default_freq_str: str):
     split._helper_freq_fallback_patched = True
     print(f"[patch] split._shift_timestamp_helper patched: fallback freq={default_freq_str}")
 
-def _patch_gluonts_feature_update_cache():
+def _patch_gluonts_feature_update_cache(default_freq_str: str):
+    """
+    关键修复：确保
+      1) 使用有效 freq（优先 self.freq，否则 default_freq_str）
+      2) full_date_range 为以 Timestamp 为元素的 pd.date_range
+      3) 同步构建 self._date_index（键为 Timestamp），避免 KeyError
+    """
     try:
         import gluonts.transform.feature as gf
     except Exception as e:
@@ -79,6 +85,7 @@ def _patch_gluonts_feature_update_cache():
             def new_update_cache(self, start, length, _orig=meth):
                 try:
                     freq_str = getattr(self, "freq", None)
+                    # 1) 规范起始时间为 Timestamp
                     if isinstance(start, pd.Period):
                         if freq_str is None:
                             try: freq_str = start.freqstr
@@ -86,23 +93,24 @@ def _patch_gluonts_feature_update_cache():
                         ts_start = start.to_timestamp(how="start")
                     else:
                         ts_start = pd.Timestamp(start)
+                    # 2) 频率兜底
                     if freq_str is None:
-                        freq_str = "D"
-                    try:
-                        off = to_offset(freq_str)
-                        setattr(self, "_freq_base", getattr(off, "base", None))
-                    except Exception:
-                        try: setattr(self, "_freq_base", None)
-                        except Exception: pass
-                    self.full_date_range = pd.date_range(ts_start, periods=length, freq=to_offset(freq_str))
+                        freq_str = getattr(self, "_default_freq_hint", None) or default_freq_str
+                    off = to_offset(freq_str)
+                    # 3) 构建完整日期序列（元素是 Timestamp）
+                    self.full_date_range = pd.date_range(ts_start, periods=int(length), freq=off)
+                    # 4) 同步建立 _date_index：Timestamp -> idx
+                    self._date_index = {ts: i for i, ts in enumerate(self.full_date_range)}
+                    return
                 except Exception:
+                    # 失败则退回原实现
                     return _orig(self, start, length)
 
             new_update_cache._patched_period_safe = True
             setattr(obj, "_update_cache", new_update_cache)
             patched = True
     if patched:
-        print("[patch] GluonTS feature._update_cache patched for Period/Timestamp")
+        print("[patch] GluonTS feature._update_cache patched for Period/Timestamp (+_date_index)")
     else:
         print("[patch] No suitable _update_cache found to patch (maybe already compatible).")
 
@@ -163,5 +171,5 @@ def apply_all(freq_hint: str = "D"):
     """
     _patch_process_start_field_keep_period(freq_hint)
     _patch_split_shift_timestamp(freq_hint)
-    _patch_gluonts_feature_update_cache()
+    _patch_gluonts_feature_update_cache(freq_hint)   # ← 带入频率
     _patch_gluonts_convert_safe()
