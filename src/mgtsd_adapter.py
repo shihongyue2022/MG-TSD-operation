@@ -14,28 +14,48 @@ import pandas as pd
 from gluonts.dataset.common import ListDataset
 from gluonts.exceptions import GluonTSDataError
 
-# ========== PATCH: 强化 GluonTS 时间特征构造，避免 _date_index 断言/索引错误 ==========
+# ===================== GluonTS 时间相关补丁（稳健） =====================
+
+# 1) 允许 GluonTS 安全处理 pandas.Period 起始时间
+try:
+    import gluonts.dataset.common as _gdc
+
+    def _safe_process_start(timestamp_input, freq):
+        if isinstance(timestamp_input, pd.Period):
+            return pd.Timestamp(timestamp_input.start_time)
+        try:
+            return pd.Timestamp(timestamp_input)
+        except Exception:
+            return pd.Timestamp(str(timestamp_input))
+
+    if hasattr(_gdc, "ProcessStartField"):
+        _gdc.ProcessStartField.process = staticmethod(_safe_process_start)  # type: ignore
+        print("[patch] GluonTS ProcessStartField.process patched: Period -> Timestamp(start)")
+except Exception as _e:
+    print(f"[patch] WARN: failed to patch ProcessStartField ({_e})")
+
+# 2) 强化 AddTimeFeatures：确保 start/freq 稳定 + time_features 非空 + _date_index 可索引
 try:
     from gluonts.transform.feature import AddTimeFeatures as _ATF  # type: ignore
+    from gluonts.time_feature import time_features_from_frequency_str, DayOfWeek
+
+    _orig_atf_init = getattr(_ATF, "__init__", None)
     _orig_update_cache = getattr(_ATF, "_update_cache", None)
     _orig_map_transform = getattr(_ATF, "map_transform", None)
 
-    def _to_rule_code(x) -> Optional[str]:
+    def _rule_code(x) -> Optional[str]:
         try:
-            # pandas offset -> 规则码，例如 <BusinessDay> -> "B"
             return getattr(x, "rule_code", None) or getattr(x, "freqstr", None) or str(x)
         except Exception:
             return None
 
     def _norm_start_and_freq(start, fallback_freq: str = "B") -> Tuple[pd.Timestamp, str]:
-        """把 start 归一到 Timestamp，并返回稳定的 freq 字符串。"""
         if isinstance(start, pd.Period):
             freq_str = start.freqstr or fallback_freq
             return start.start_time, str(freq_str)
         if isinstance(start, pd.Timestamp):
-            # 有些版本 Timestamp.freq 为空；优先用 fallback
             fs = getattr(start, "freq", None)
-            freq_str = _to_rule_code(fs) or fallback_freq
+            freq_str = _rule_code(fs) or fallback_freq
             return start, str(freq_str)
         try:
             p = pd.Period(str(start), freq=fallback_freq)
@@ -43,18 +63,27 @@ try:
         except Exception:
             return pd.Timestamp("2000-01-01"), fallback_freq
 
+    # 2.1 __init__：若 time_features 为空，回退 DayOfWeek，避免后续空数组拼接
+    if callable(_orig_atf_init):
+        def _patched_atf_init(self, *args, **kwargs):
+            tf = kwargs.get("time_features", None)
+            if not tf:
+                # 如果调用方没提供或提供了空列表，则按 freq 推断；若仍为空，则兜底 DayOfWeek
+                freq = kwargs.get("freq", "B") or "B"
+                tf = time_features_from_frequency_str(str(freq)) or [DayOfWeek()]
+                kwargs["time_features"] = tf
+            return _orig_atf_init(self, *args, **kwargs)
+        _ATF.__init__ = _patched_atf_init  # type: ignore
+
+    # 2.2 _update_cache：构建完整 date_range，并把 _date_index 变成 dict{Timestamp->idx}
     if callable(_orig_update_cache):
         def _patched_update_cache(self, start, length):
-            # 统一为 Timestamp + 明确的 freq 字符串
             freq_attr = getattr(self, "freq", None)
-            fb = _to_rule_code(freq_attr) or "B"
+            fb = _rule_code(freq_attr) or "B"
             start_ts, freq_str = _norm_start_and_freq(start, fb)
-
-            # 优先走原实现
             try:
                 return _orig_update_cache(self, start_ts, length)
             except Exception:
-                # 兜底：构造 full_date_range，并将 _date_index 设为 dict{Timestamp: idx}
                 try:
                     self.full_date_range = pd.date_range(start=start_ts, periods=int(length), freq=freq_str)
                 except Exception:
@@ -62,35 +91,34 @@ try:
                 try:
                     self._date_index = {ts: i for i, ts in enumerate(self.full_date_range)}
                 except Exception:
-                    # 再兜底：转 Timestamp 强制一致
                     self._date_index = {pd.Timestamp(ts): i for i, ts in enumerate(list(self.full_date_range))}
                 return None
         _ATF._update_cache = _patched_update_cache  # type: ignore
 
+    # 2.3 map_transform：统一 start 为 Timestamp，确保 _date_index 可用
     if callable(_orig_map_transform):
         def _patched_map_transform(self, data, is_train):
-            # 统一 start -> Timestamp；并提前确保 _date_index 是 dict
             freq_attr = getattr(self, "freq", None)
-            fb = _to_rule_code(freq_attr) or "B"
+            fb = _rule_code(freq_attr) or "B"
 
-            start_orig = data.get(getattr(self, "start_field", "start"))
+            start_field = getattr(self, "start_field", "start")
+            target_field = getattr(self, "target_field", "target")
+
+            start_orig = data.get(start_field)
             start_ts, _ = _norm_start_and_freq(start_orig, fb)
-            data[getattr(self, "start_field", "start")] = start_ts  # 关键：传 Timestamp 而不是 Period
+            data[start_field] = start_ts
 
-            # 估计序列长度（target 必有）
-            tgt = data.get(getattr(self, "target_field", "target"))
+            tgt = data.get(target_field)
             try:
-                length = int(tgt.shape[-1]) if hasattr(tgt, "shape") else int(len(tgt))
+                length = int(getattr(tgt, "shape", [0])[-1]) if tgt is not None else 1024
             except Exception:
                 length = 1024
 
-            # 先手动更新一次 cache，避免 _date_index 为 None
             try:
                 self._update_cache(start_ts, length)
             except Exception:
                 pass
 
-            # 确保 _date_index 为 dict（原库需要 _date_index[start] 返回整型位置）
             if not isinstance(getattr(self, "_date_index", None), dict):
                 try:
                     fr = getattr(self, "full_date_range", None)
@@ -103,21 +131,63 @@ try:
                     self.full_date_range = dr
                     self._date_index = {ts: i for i, ts in enumerate(dr)}
 
-            # 再交回原实现（此时 _date_index[start_ts] 一定是整数）
             try:
                 return _orig_map_transform(self, data, is_train)
             except AssertionError:
-                # 极端兜底：若仍断言，则重建 _date_index 后再试一次
                 fr = getattr(self, "full_date_range", pd.date_range(start=start_ts, periods=length, freq=fb))
                 self._date_index = {ts: i for i, ts in enumerate(fr)}
                 return _orig_map_transform(self, data, is_train)
 
         _ATF.map_transform = _patched_map_transform  # type: ignore
 
-    print("[patch] GluonTS AddTimeFeatures patched: Timestamp start + dict(_date_index)")
+    print("[patch] GluonTS AddTimeFeatures patched: default time_features + robust start/freq/_date_index")
 except Exception as _e:
     print(f"[patch] WARN: failed to patch AddTimeFeatures ({_e})")
-# =====================================================================
+
+# 3) VstackFeatures 在上游字段缺失时可能触发 np.vstack([])；这里做容错
+try:
+    import gluonts.transform.convert as _gconv
+
+    _orig_convert_transform = getattr(_gconv.Convert, "transform", None)
+
+    if callable(_orig_convert_transform):
+        def _patched_convert_transform(self, data):
+            try:
+                return _orig_convert_transform(self, data)
+            except ValueError as e:
+                if "need at least one array to concatenate" not in str(e):
+                    raise
+                # 兜底：当输入字段都缺失时，构造一个形状合理的全零特征，避免崩溃
+                # 推断时间长度
+                def _len_from(obj) -> Optional[int]:
+                    try:
+                        if obj is None:
+                            return None
+                        sh = getattr(obj, "shape", None)
+                        if sh is not None and len(sh) >= 1:
+                            return int(sh[-1])
+                        return int(len(obj))
+                    except Exception:
+                        return None
+
+                length = None
+                for k in ("target", "feat_dynamic_real", "feat_age"):
+                    if k in data:
+                        length = _len_from(data[k])
+                        if length:
+                            break
+                if length is None:
+                    length = 1
+                out = np.zeros((1, int(length)), dtype=float)  # 用一条零特征占位
+                data[self.output_field] = out
+                return data
+
+        _gconv.Convert.transform = _patched_convert_transform  # type: ignore
+        print("[patch] GluonTS Convert.transform patched: safe empty vstack/hstack")
+except Exception as _e:
+    print(f"[patch] WARN: failed to patch Vstack/Convert ({_e})")
+
+# ===================== 以上为 GluonTS 兼容/容错补丁 =====================
 
 
 # ---------- deps stubs & compat aliases ----------
@@ -424,6 +494,7 @@ class MGAdapter:
     # ---------- 数据集构造（仅数据侧兜底） ----------
 
     def _min_required_len(self, ctx:int, pred:int, max_lag:int) -> int:
+        # 保证长度：max_lag + max(ctx, min_ctx_floor) + pred + safety_margin
         ctx_eff = max(ctx, self.min_ctx_floor)
         return max_lag + ctx_eff + pred + self.safety_margin
 
@@ -502,6 +573,7 @@ class MGAdapter:
                     num_parallel_samples=cur_train_pred,
                     force_input_size=cur_force_input_size,
                 )
+                # 在构网前把 lags 明确设置进去（估计器常见字段名都试一遍）
                 for k in ("lags_seq", "lags", "lag_indices", "lag_seq"):
                     if hasattr(est, k):
                         setattr(est, k, [1] if cur_max_lag <= 1 else list(range(1, cur_max_lag + 1)))
@@ -512,15 +584,17 @@ class MGAdapter:
 
             except GluonTSDataError as ge:
                 msg = str(ge)
+                # 1D/2D 自动切换
                 if _need_2d(msg) and not cur_expect_2d:
                     cur_expect_2d = True
                     continue
                 if _need_1d(msg) and cur_expect_2d:
                     cur_expect_2d = False
                     continue
-                raise
+                raise  # 其它 GluonTSDataError 无法兜底
 
             except AssertionError as ae:
+                # 典型：lags cannot go further than history length, found lag X while history length is only Y
                 text = str(ae)
                 lag_hist = _is_lag_hist_assert(text)
                 if lag_hist is not None:
@@ -538,6 +612,8 @@ class MGAdapter:
 
             except RuntimeError as re_err:
                 text = str(re_err)
+
+                # RNN input_size 不匹配 -> 解析 "Expected x, got y" 并重建 Estimator
                 got = _parse_input_size_mismatch(text)
                 if got is not None and (cur_force_input_size or (self.input_size or 1)) != got:
                     print(f"[mgtsd_adapter] 侦测到 input_size 不匹配：Estimator.input_size="
@@ -545,6 +621,7 @@ class MGAdapter:
                     cur_force_input_size = got
                     continue
 
+                # circular padding -> 先提升最小上下文下限，再按新的 ctx 重试；到达阈值仍报错则放大训练用 pred_len
                 if "Padding value causes wrapping around more than once" in text:
                     if bumps_ctx < self.max_pad_bumps_ctx:
                         new_floor = 128 if cur_min_ctx < 128 else cur_min_ctx + 96
@@ -554,6 +631,7 @@ class MGAdapter:
                         cur_ctx = max(cur_ctx, cur_min_ctx)
                         bumps_ctx += 1
                         continue
+                    # ctx 已提升多次仍不够 -> 放大训练用 prediction_length（推理仍按原 pred_len 截取）
                     if bumps_pred < self.max_pred_bumps and cur_train_pred < self.pred_len_cap:
                         new_pred = min(int(max(cur_train_pred * self.pred_bump_growth, cur_train_pred + 1)), self.pred_len_cap)
                         print(f"[mgtsd_adapter] circular padding 仍存在 -> 放大训练用 prediction_length: {cur_train_pred} -> {new_pred} (推理仍按 {prediction_length} 截取)")
@@ -637,6 +715,7 @@ class MGAdapter:
                     S = np.concatenate([S] * rep, axis=0)[:num_samples, :]
             return S
 
+        # 推理侧也仅做数据兜底，不动模型
         min_need = self._min_required_len(ctx=pred_len, pred=pred_len, max_lag=1)
         if self._trained_expect_2d:
             tgt = _as_2d_target(x_ctx.astype(float))
@@ -673,6 +752,7 @@ def _try_inject_hparams(estimator,
                         device: Optional[str] = None,
                         batch_size: Optional[int] = None,
                         epochs: Optional[int] = None):
+    # 优先走统一入口（若提供）
     for name in ("set_hparams", "set_params", "configure"):
         if hasattr(estimator, name) and callable(getattr(estimator, name)):
             try:
@@ -691,6 +771,7 @@ def _try_inject_hparams(estimator,
             except Exception:
                 pass
 
+    # 否则逐项尝试设置属性（容错）
     def _safe_set(obj, key, val):
         if hasattr(obj, key) and val is not None:
             try: setattr(obj, key, val)
