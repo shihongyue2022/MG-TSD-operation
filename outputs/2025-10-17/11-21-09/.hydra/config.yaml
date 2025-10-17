@@ -1,0 +1,61 @@
+random_seed: 42
+fourier_transform: true
+standardize: true
+score_model:
+  noise_scheduler:
+    _target_: fdiff.schedulers.sde.VPScheduler
+    eps: 1.0e-05
+    beta_min: 0.1
+    beta_max: 20
+    fourier_noise_scaling: ${score_model.fourier_noise_scaling}
+  _target_: fdiff.models.score_models.ScoreModule
+  _partial_: true
+  d_model: 72
+  num_layers: 10
+  n_head: 12
+  lr_max: 0.001
+  fourier_noise_scaling: ${fourier_transform}
+  likelihood_weighting: false
+datamodule:
+  datamodule: fdiff.dataloaders.datamodules.GluonTSJsonDatamodule
+  data_dir: ${oc.env:FDIFF_DATA_DIR,""}
+  batch_size: 64
+  window_length: 200
+  pred_len: 30
+  stride: 1
+  standardize: true
+  num_workers: 4
+  pin_memory: true
+  val_ratio: 0.1
+  jsonl_train: null
+  jsonl_test: null
+trainer:
+  callbacks:
+  - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+  - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: val/loss
+    filename: epoch={epoch}-val_loss={val/loss:.2f}
+    auto_insert_metric_name: false
+  - _target_: fdiff.utils.callbacks.SamplingCallback
+    every_n_epochs: 10
+    sample_batch_size: ${sampler.sample_batch_size}
+    num_samples: 200
+    num_diffusion_steps: 1000
+    metrics:
+    - _target_: fdiff.sampling.metrics.SlicedWasserstein
+      _partial_: true
+      random_seed: ${random_seed}
+      num_directions: 200
+    - _target_: fdiff.sampling.metrics.MarginalWasserstein
+      _partial_: true
+      random_seed: ${random_seed}
+  _target_: pytorch_lightning.Trainer
+  accelerator: auto
+  max_epochs: 5
+  gradient_clip_val: 1.0
+  enable_progress_bar: true
+  logger:
+    _target_: pytorch_lightning.loggers.WandbLogger
+    log_model: true
+sampler:
+  sample_batch_size: 64

@@ -1,0 +1,4 @@
+- fourier_transform=true
+- datamodule=gluonts_json
+- +sampler.sample_batch_size=64
+- trainer.max_epochs=5
