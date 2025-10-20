@@ -383,6 +383,8 @@ class MGAdapter:
         self.predictor = None
         self._trained_expect_2d = False
 
+        self.epoch_callback = None
+
         # 超参（来自 cfg 顶层或 mgtsd 子块）
         self.epoch       = int(cfg.get("epoch", cfg.get("epochs", 30)))
         self.diff_steps  = int(cfg.get("diff_steps", 100))
@@ -484,6 +486,14 @@ class MGAdapter:
             else:
                 raise
 
+        cb = getattr(self, "epoch_callback", None)
+        if cb is not None:
+            trainer = getattr(est, "trainer", None)
+            if trainer is not None:
+                try:
+                    trainer.epoch_callback = cb
+                except Exception as e:
+                    print(f"[mgtsd_adapter] WARN: failed to attach epoch_callback ({e})")
         _try_inject_hparams(
             est,
             mg_list=self.mg_list,

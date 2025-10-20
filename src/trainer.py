@@ -1,5 +1,5 @@
 import time
-from typing import Optional, Union
+from typing import Optional, Union, Callable, Any
 
 from tqdm.auto import tqdm
 
@@ -39,6 +39,7 @@ class Trainer:
         self.device = device
         self.total_step = 0
         self.log_metrics = kwargs.get('log_metrics')
+        self.epoch_callback: Optional[Callable[..., Any]] = kwargs.get('epoch_callback')
         print(f'self.log_metrics: {self.log_metrics}')
 
     def __call__(
@@ -149,3 +150,18 @@ class Trainer:
 
             # mark epoch end time and log time cost of current epoch
             toc = time.time()
+
+            callback = getattr(self, "epoch_callback", None)
+            if callable(callback):
+                try:
+                    callback(
+                        epoch=epoch_no + 1,
+                        trainer=self,
+                        net=net,
+                        estimator=estimator,
+                        transformation=transformation,
+                        device=self.device,
+                        train_time_sec=toc - tic,
+                    )
+                except Exception as cb_err:
+                    print(f"[trainer] WARN: epoch_callback failed at epoch {epoch_no + 1}: {cb_err}")
