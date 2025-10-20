@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional, Iterable, Tuple, List
 import numpy as np
 import torch
 import pandas as pd
+from tqdm.auto import tqdm
+import pickle
 import warnings
 from gluonts.dataset.common import ListDataset
 from gluonts.exceptions import GluonTSDataError
@@ -670,6 +672,24 @@ class MGAdapter:
                     num_samples_for_predictor: int):
         _ensure_wandb_stub()
 
+        ckpt_path = self.ckpt_path.expanduser() if self.ckpt_path else None
+        if ckpt_path and ckpt_path.is_file():
+            try:
+                print(f"[mgtsd_adapter] Loading predictor from checkpoint {ckpt_path}")
+                with ckpt_path.open('rb') as f:
+                    self.predictor = pickle.load(f)
+                self._trained_expect_2d = getattr(self.predictor, '_expect_2d', False)
+                if hasattr(self.predictor, 'net'):
+                    try:
+                        self.predictor.net.to(self.device)
+                    except Exception:
+                        pass
+                return self
+            except Exception as exc:
+                print(f"[mgtsd_adapter] WARN: failed to load checkpoint ({exc}); fall back to training")
+        elif ckpt_path:
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
         items = list(train_items)
 
         if self.input_size is None or self.target_dim is None:
@@ -694,6 +714,13 @@ class MGAdapter:
             )
             self.predictor = pred
             self._trained_expect_2d = used_2d
+            if ckpt_path:
+                try:
+                    with ckpt_path.open('wb') as f:
+                        setattr(self.predictor, '_expect_2d', self._trained_expect_2d)
+                        pickle.dump(self.predictor, f)
+                except Exception as exc:
+                    print(f"[mgtsd_adapter] WARN: failed to save checkpoint ({exc})")
             return self
         except Exception:
             estimator = self._build_estimator(prediction_length, context_length, freq, num_samples_for_predictor)
@@ -703,6 +730,13 @@ class MGAdapter:
             )
             self.predictor = pred
             self._trained_expect_2d = used_2d
+            if ckpt_path:
+                try:
+                    with ckpt_path.open('wb') as f:
+                        setattr(self.predictor, '_expect_2d', self._trained_expect_2d)
+                        pickle.dump(self.predictor, f)
+                except Exception as exc:
+                    print(f"[mgtsd_adapter] WARN: failed to save checkpoint ({exc})")
             return self
 
     # ---------- 推理 ----------
